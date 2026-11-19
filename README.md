@@ -32,6 +32,7 @@ Each component has `POST /v1/<operation>` accepting its JSON request object. Res
 | `snapshots` | FIFO marker snapshots with independently recorded in-flight channel messages and overlapping capture sessions. |
 | `placement` | Exhaustive bounded replica placement against explicit failure sets, with survivor certificates. |
 | `aggregation` | Client-side pairwise X25519-derived additive masks and fixed-roster aggregate verification. |
+| `sync` | Incremental dimension-table sync: generational add/remove batches, durable watermark-coupled commits, observed-remove concurrency and independent ledger replay. |
 
 ## Request examples
 
@@ -49,6 +50,44 @@ Use one operation request from that output as the JSON body for its `/v1/<operat
 Replica identities must be distinct and are not recycled; removed-dot metadata is retained. Transaction results are conflict serializability, not a claim about every possible isolation model. Snapshot channels are reliable FIFO and run in a deterministic local message runtime. Aggregation requires all participants and at least three clients; a missing participant aborts. It assumes an honest fixed roster and semi-honest participants, lacks deployment authentication, and is not a dropout-tolerant or formally certified protocol. Client private material stays in memory and is not returned by the service.
 
 Runtime state uses explicit temporary directories or caller-provided library objects. Service examples are per-request computations; use the library interfaces for persistent state and long-lived readers.
+
+## Incremental dimension-table sync (`sync`)
+
+`causalmesh.sync.SyncEngine` builds the recovery entry point on top of the causal
+OR-set. It answers "which members are still in the dimension table now" rather
+than re-importing members that were previously deleted.
+
+* **Batch input.** Each batch carries a source event identity `(source, seq)`,
+  member generations `(name, generation)`, and `adds` / `removes` lists.
+  Removes may name the observed add events explicitly; without explicit
+  evidence they observe only the add-dots currently visible for that exact
+  generational member.
+* **Coupled commit and progress.** The dimension-table change, the per-source
+  contiguous watermark and the acknowledgement record advance in one durable
+  revision. Re-delivered batches return the original result
+  (`replayed: true`); a redelivery with different content for the same event
+  identity is rejected as `DuplicateBatchError`. Gap batches are held until
+  the missing predecessor arrives.
+* **Observed-remove concurrency.** A remove never tombstones an add it did not
+  observe, so delivery order cannot turn the semantics into last-writer-wins.
+* **Generational fencing.** A reused name with an older generation is a
+  different, stale writer; `StaleGenerationError` explains the rejected
+  generation and the generation already committed.
+* **Retained delete evidence.** Unresolved remove evidence (the observed add
+  is still partitioned away) is retained across restarts and compaction, and
+  tombstones the add as soon as it lands. Tombstones are never garbage
+  collected to save space.
+* **Durable recovery and independent change model.** Every commit is an
+  immutable hash-chained ledger record. `replay()` rebuilds members,
+  watermarks, clocks, fences, tombstones and pending evidence from the ledger
+  alone; `audit()` cross-checks it against the materialized state. A monotonic
+  epoch file outside the state image blocks re-entry of old disk state, and
+  `reconcile_dir()` cleans interrupted commit-point artifacts.
+
+The HTTP `sync` operation is stateless: `action=start` returns a state image,
+and `apply` / `query` / `audit` / `replay` / `compact` carry that image inside
+the request and return the next one. For durable, long-lived readers use
+`SyncEngine(target, directory=...)` directly.
 
 ## Dependencies
 
